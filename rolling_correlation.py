@@ -2,7 +2,12 @@
 
 過去データに対してウィンドウをスライドさせ、相関の時間変化を追跡する。
 相関崩壊の検出やレジーム分類に使用。
-ローリングMST（正規化木長の時間変化）も含む。
+
+ローリング指標:
+- NTL（正規化木長）: Onnela et al. (2003)
+- Jaccard指数: MDPI Entropy (2021)
+- ハブ通貨追跡: Keskin et al. (2011)
+- 代数的連結性: 星野 (2025)
 """
 
 from __future__ import annotations
@@ -10,7 +15,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from graph_builder import build_mst, calc_normalized_tree_length
+from graph_builder import (
+    build_mst,
+    calc_algebraic_connectivity,
+    calc_mst_jaccard,
+    calc_normalized_tree_length,
+    get_mst_hub,
+)
 
 
 def calc_rolling_correlation(
@@ -164,3 +175,70 @@ def calc_rolling_ntl(
         times.append(returns.index[end])
 
     return pd.Series(ntl_values, index=times, name="NTL")
+
+
+def calc_rolling_all_metrics(
+    closes: pd.DataFrame,
+    window: int = 50,
+    threshold: float = 0.3,
+) -> pd.DataFrame:
+    """全ローリング指標を一括計算する.
+
+    1回のループでNTL・Jaccard・ハブ・代数的連結性・密度を同時に計算。
+    過去検証タブの効率化用。
+
+    Args:
+        closes: 終値DataFrame
+        window: ローリングウィンドウ
+        threshold: 相関閾値（密度計算用）
+
+    Returns:
+        全指標を含むDataFrame（index=時刻）
+    """
+    returns = closes.pct_change().dropna()
+    symbols = returns.columns.tolist()
+    n_pairs = len(symbols) * (len(symbols) - 1) / 2
+
+    records = []
+    prev_mst = None
+
+    for end in range(window, len(returns)):
+        start = end - window
+        window_returns = returns.iloc[start:end]
+        corr = window_returns.corr()
+
+        # MST構築
+        mst = build_mst(corr)
+
+        # NTL
+        ntl = calc_normalized_tree_length(mst)
+
+        # Jaccard指数（前回MSTとの比較）
+        jaccard = calc_mst_jaccard(prev_mst, mst) if prev_mst is not None else 1.0
+
+        # ハブ通貨
+        hub = get_mst_hub(mst)
+
+        # 代数的連結性（MST上で計算）
+        alg_conn = calc_algebraic_connectivity(mst)
+
+        # グラフ密度（閾値ベース）
+        count = 0
+        for i in range(len(symbols)):
+            for j in range(i + 1, len(symbols)):
+                if abs(corr.iloc[i, j]) >= threshold:
+                    count += 1
+        density = count / n_pairs if n_pairs > 0 else 0
+
+        records.append({
+            "time": returns.index[end],
+            "NTL": ntl,
+            "Jaccard": jaccard,
+            "hub": hub,
+            "algebraic_connectivity": alg_conn,
+            "density": round(density, 4),
+        })
+
+        prev_mst = mst
+
+    return pd.DataFrame(records).set_index("time")
