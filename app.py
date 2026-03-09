@@ -17,10 +17,19 @@ import streamlit as st
 
 from correlation import calc_correlation_matrix, filter_by_threshold
 from data_fetcher import DEFAULT_SYMBOLS, TIMEFRAMES, fetch_multi_pair_closes
-from graph_builder import build_graph, calc_graph_metrics, get_graph_summary
+from graph_builder import (
+    build_graph,
+    build_mst,
+    calc_graph_metrics,
+    calc_mst_metrics,
+    calc_normalized_tree_length,
+    get_graph_summary,
+    get_mst_summary,
+)
 from rolling_correlation import (
     calc_rolling_correlation,
     calc_rolling_graph_density,
+    calc_rolling_ntl,
     detect_correlation_breakdowns,
 )
 
@@ -35,7 +44,7 @@ st.title("通貨相関ネットワーク")
 st.caption("グラフ理論 × FX — リアルタイム通貨間相関の可視化")
 
 # --- タブ ---
-tab_realtime, tab_backtest = st.tabs(["リアルタイム", "過去検証"])
+tab_realtime, tab_mst, tab_backtest = st.tabs(["リアルタイム", "MST（最小全域木）", "過去検証"])
 
 # --- サイドバー ---
 with st.sidebar:
@@ -184,6 +193,79 @@ def create_network_figure(G: nx.Graph) -> go.Figure:
     return fig
 
 
+# --- MST図（Plotly） ---
+def create_mst_figure(mst: nx.Graph) -> go.Figure:
+    """PlotlyでMST（最小全域木）を描画する."""
+    pos = nx.spring_layout(mst, seed=42, k=3.0)
+
+    edge_traces = []
+    for u, v, data in mst.edges(data=True):
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        corr = data.get("correlation", 0)
+        dist = data.get("weight", 0)
+        color = "rgba(197, 61, 67, 0.7)" if corr > 0 else "rgba(43, 60, 94, 0.7)"
+        width = max(1.5, (2 - dist) * 4)
+
+        edge_traces.append(
+            go.Scatter(
+                x=[x0, x1, None],
+                y=[y0, y1, None],
+                mode="lines",
+                line=dict(width=width, color=color),
+                hoverinfo="text",
+                text=f"{u} ↔ {v}<br>相関: {corr:+.3f}<br>距離: {dist:.3f}",
+                showlegend=False,
+            )
+        )
+
+    degrees = dict(mst.degree())
+    node_x = [pos[n][0] for n in mst.nodes()]
+    node_y = [pos[n][1] for n in mst.nodes()]
+    node_degrees = [degrees[n] for n in mst.nodes()]
+    node_text = [
+        f"{n}<br>MST次数: {degrees[n]}"
+        for n in mst.nodes()
+    ]
+
+    node_trace = go.Scatter(
+        x=node_x,
+        y=node_y,
+        mode="markers+text",
+        text=list(mst.nodes()),
+        textposition="top center",
+        textfont=dict(size=14, color="#333"),
+        hovertext=node_text,
+        hoverinfo="text",
+        marker=dict(
+            size=[max(30, d * 12 + 20) for d in node_degrees],
+            color=node_degrees,
+            colorscale="YlOrRd",
+            showscale=True,
+            colorbar=dict(title="MST次数", thickness=15),
+            line=dict(width=2, color="#333"),
+        ),
+        showlegend=False,
+    )
+
+    fig = go.Figure(data=[*edge_traces, node_trace])
+    fig.update_layout(
+        height=600,
+        margin=dict(l=20, r=20, t=40, b=20),
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        plot_bgcolor="white",
+        annotations=[
+            dict(
+                text="MST: 全通貨を最小コストで接続する木構造 / 赤=正の相関 / 青=負の相関",
+                x=0.5, y=-0.05, xref="paper", yref="paper",
+                showarrow=False, font=dict(size=12, color="gray"),
+            )
+        ],
+    )
+    return fig
+
+
 # ========================================
 # リアルタイムタブ
 # ========================================
@@ -248,6 +330,68 @@ with tab_realtime:
 
 
 # ========================================
+# MSTタブ
+# ========================================
+with tab_mst:
+    closes_mst = load_data(
+        _symbols=tuple(DEFAULT_SYMBOLS),
+        _timeframe=timeframe,
+        _count=count,
+    )
+
+    if closes_mst is None:
+        st.warning("MT5を起動してからページを更新してください。")
+        st.stop()
+
+    corr_mst = calc_correlation_matrix(closes_mst, method=corr_method)
+    mst = build_mst(corr_mst)
+
+    col_mst_graph, col_mst_info = st.columns([3, 2])
+
+    with col_mst_graph:
+        st.subheader("最小全域木（MST）")
+        fig_mst = create_mst_figure(mst)
+        st.plotly_chart(fig_mst, use_container_width=True)
+
+    with col_mst_info:
+        st.subheader("距離行列ヒートマップ")
+        from graph_builder import _corr_to_distance
+        dist_matrix = _corr_to_distance(corr_mst)
+        heatmap_dist = px.imshow(
+            dist_matrix,
+            color_continuous_scale="Viridis_r",
+            zmin=0, zmax=2,
+            aspect="equal",
+            text_auto=".2f",
+        )
+        heatmap_dist.update_layout(height=500, margin=dict(l=20, r=20, t=20, b=20))
+        st.plotly_chart(heatmap_dist, use_container_width=True)
+
+    st.subheader("MST指標")
+    col_mst_summary, col_mst_metrics = st.columns([1, 3])
+
+    with col_mst_summary:
+        mst_summary = get_mst_summary(mst)
+        for key, val in mst_summary.items():
+            st.metric(label=key, value=val)
+
+    with col_mst_metrics:
+        mst_metrics = calc_mst_metrics(mst)
+        st.dataframe(mst_metrics, use_container_width=True, hide_index=True)
+
+    with st.expander("MST指標の解説"):
+        st.markdown("""
+        | 指標 | 意味 | FXでの解釈 |
+        |------|------|------------|
+        | **MST次数** | MSTでの接続数 | 高い = その通貨がハブ（中心通貨）。市場の情報がこの通貨を経由して伝播 |
+        | **MST媒介中心性** | MST上の最短経路を通る頻度 | 高い = 通貨グループ間の橋渡し。ここが動くと波及効果大 |
+        | **葉ノード** | 末端ノード（次数1） | 市場構造の周辺に位置。独自の動きをしやすい |
+        | **正規化木長(NTL)** | MSTエッジ距離の平均 | 低い = 市場全体が連動（危機時に収縮）。高い = バラバラ |
+        | **ハブ通貨** | MST次数が最大の通貨 | 市場の中心。危機時にUSD系が中心化する傾向 |
+        """)
+
+
+# ========================================
 # 過去検証タブ
 # ========================================
 with tab_backtest:
@@ -267,6 +411,35 @@ with tab_backtest:
         f"{len(closes_bt.columns)}通貨ペア × {len(closes_bt)}本 / "
         f"ウィンドウ: {rolling_window}本"
     )
+
+    # --- 0. NTL（正規化木長）の推移 ---
+    st.subheader("MST正規化木長（NTL）の推移")
+    st.caption(
+        "Onnela et al. (2003): NTL低下 = 市場が収縮（危機・強トレンド） / "
+        "NTL上昇 = 通貨がバラバラに動く"
+    )
+
+    ntl_series = calc_rolling_ntl(closes_bt, window=rolling_window)
+
+    fig_ntl = go.Figure()
+    fig_ntl.add_trace(
+        go.Scatter(
+            x=ntl_series.index,
+            y=ntl_series.values,
+            mode="lines",
+            fill="tozeroy",
+            line=dict(color="#2B3C5E", width=2),
+            fillcolor="rgba(43, 60, 94, 0.2)",
+            name="NTL",
+        )
+    )
+    fig_ntl.update_layout(
+        height=300,
+        margin=dict(l=20, r=20, t=20, b=20),
+        yaxis=dict(title="正規化木長"),
+        xaxis=dict(title="時刻"),
+    )
+    st.plotly_chart(fig_ntl, use_container_width=True)
 
     # --- 1. グラフ密度の推移 ---
     st.subheader("グラフ密度の推移")

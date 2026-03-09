@@ -2,12 +2,15 @@
 
 過去データに対してウィンドウをスライドさせ、相関の時間変化を追跡する。
 相関崩壊の検出やレジーム分類に使用。
+ローリングMST（正規化木長の時間変化）も含む。
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+
+from graph_builder import build_mst, calc_normalized_tree_length
 
 
 def calc_rolling_correlation(
@@ -127,3 +130,37 @@ def detect_correlation_breakdowns(
         .sort_values("time")
         .reset_index(drop=True)
     )
+
+
+def calc_rolling_ntl(
+    closes: pd.DataFrame,
+    window: int = 50,
+) -> pd.Series:
+    """ローリングウィンドウで正規化木長（NTL）の時間変化を計算する.
+
+    Onnela et al. (2003) の手法。MSTの木長が収縮すると
+    市場全体が連動 = 危機やトレンドの兆候。
+
+    Args:
+        closes: 終値DataFrame
+        window: ローリングウィンドウ
+
+    Returns:
+        時刻→NTL のSeries
+    """
+    returns = closes.pct_change().dropna()
+    ntl_values = []
+    times = []
+
+    for end in range(window, len(returns)):
+        start = end - window
+        window_returns = returns.iloc[start:end]
+        corr = window_returns.corr()
+
+        mst = build_mst(corr)
+        ntl = calc_normalized_tree_length(mst)
+
+        ntl_values.append(ntl)
+        times.append(returns.index[end])
+
+    return pd.Series(ntl_values, index=times, name="NTL")
